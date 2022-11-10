@@ -1,7 +1,7 @@
 # mpeg
 
 This repository contains a [Go] module for reading information from MPEG
-(and particularly MP3) files.
+(and particularly MP3) audio files.
 
 It was originally written as part of [nup] and is exercised by tests in that
 repository.

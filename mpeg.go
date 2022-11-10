@@ -1,6 +1,7 @@
 // Copyright 2022 Daniel Erat.
 // All rights reserved.
 
+// Package mpeg returns information about MPEG (and specifically MP3) audio files.
 package mpeg
 
 import (
@@ -18,6 +19,8 @@ import (
 	"github.com/derat/taglib-go/taglib/id3"
 )
 
+// ID3v1Tag contains information from an ID3v1 footer at the end of an MP3 file.
+// ID3v1 is a terrible format: https://id3.org/ID3v1
 type ID3v1Tag struct {
 	Title, Artist, Album, Year, Comment string
 	Genre, Track                        byte
@@ -28,7 +31,6 @@ const ID3v1Length = 128
 
 // ReadID3v1Footer reads an ID3v1 footer from the final ID3v1Length bytes of f.
 // If the tag isn't present, the returned tag and error will be nil.
-// ID3v1 is a terrible format: https://id3.org/ID3v1
 func ReadID3v1Footer(f *os.File, fi os.FileInfo) (*ID3v1Tag, error) {
 	const (
 		footerMagic = "TAG"
