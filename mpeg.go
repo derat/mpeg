@@ -203,20 +203,26 @@ func ReadFrameInfo(f *os.File, start int64) (*FrameInfo, error) {
 	}
 	version := versions[getBits(11, 2)]
 	if version == versionRes {
-		return nil, errors.New("reserved MPEG version")
+		return nil, errors.New("invalid MPEG version")
 	}
 	if layer := layers[getBits(13, 2)]; layer != layer3 {
 		return nil, unsupportedLayerErr
 	}
 
-	return &FrameInfo{
+	finfo := FrameInfo{
 		KbitRate:        kbitRates[version][getBits(16, 4)],
 		SampleRate:      sampleRates[version][getBits(20, 2)],
 		SamplesPerFrame: samplesPerFrame[version],
 		ChannelMode:     uint8(getBits(24, 2)),
 		HasCRC:          getBits(15, 1) == 0x0,
 		HasPadding:      getBits(22, 1) == 0x1,
-	}, nil
+	}
+	if finfo.KbitRate == 0 {
+		return nil, errors.New("invalid bitrate")
+	} else if finfo.SampleRate == 0 {
+		return nil, errors.New("invalid sampling rate")
+	}
+	return &finfo, nil
 }
 
 // I've seen some files that seemed to have a bunch of junk (or at least not an MPEG header
