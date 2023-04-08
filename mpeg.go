@@ -13,6 +13,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/derat/taglib-go/taglib"
@@ -226,28 +228,32 @@ func ReadFrameInfo(f *os.File, start int64) (*FrameInfo, error) {
 }
 
 // I've seen some files that seemed to have a bunch of junk (or at least not an MPEG header
-// starting with sync bits) after the header offset identified by taglib-go. Look over this
+// starting with sync bits) after the header offset identified by taglib-go. Scan up to this
 // many bytes to try to find something that looks like a proper header.
 const maxFrameSearchBytes = 8192
 
-// ComputeAudioDuration reads Xing data from the frame at headerLen in f to return the audio length.
-// If no Xing header is present, it assumes that the file has a constant bitrate.
-// Only supports MPEG Audio 1, Layer 3.
-func ComputeAudioDuration(f *os.File, fi os.FileInfo, headerLen, footerLen int64) (
-	dur time.Duration, xingFrames int, xingBytes int64, err error) {
+// ComputeAudioDuration reads an Xing header from the frame at headerLen in f to return the audio length.
+// If no Xing header is present, it assumes that the file has a constant bitrate and returns a nil
+// VBRInfo struct. Only supports MPEG Audio 1, Layer 3.
+// TODO: Consider adding support for VBRI headers, apparently only writte by the Fraunhofer
+// encoder: https://www.codeproject.com/Articles/8295/MPEG-Audio-Frame-Header#VBRIHeader
+func ComputeAudioDuration(f *os.File, fi os.FileInfo, headerLen, footerLen int64) (time.Duration, *VBRInfo, error) {
+	// Scan forward in case there's empty space or other junk before the first frame.
 	var finfo *FrameInfo
+	var err error
 	fstart := headerLen
 	for ; fstart < headerLen+maxFrameSearchBytes; fstart++ {
 		if finfo, err = ReadFrameInfo(f, fstart); err == nil {
 			break
 		} else if err == unsupportedLayerErr {
-			return 0, 0, 0, err
+			return 0, nil, err
 		}
 	}
 	if err != nil {
-		return 0, 0, 0, fmt.Errorf("didn't find header after %#x", headerLen)
+		return 0, nil, fmt.Errorf("didn't find header after %#x", headerLen)
 	}
 
+	// Figure out where the Xing header should start.
 	xingStart := fstart + 4
 	if finfo.ChannelMode == 0x3 { // mono
 		xingStart += 17
@@ -257,36 +263,144 @@ func ComputeAudioDuration(f *os.File, fi os.FileInfo, headerLen, footerLen int64
 	if finfo.HasCRC {
 		xingStart += 2
 	}
-
-	b := make([]byte, 16)
-	if _, err := f.ReadAt(b, xingStart); err != nil {
-		return 0, 0, 0, fmt.Errorf("unable to read Xing header at %#x: %v", xingStart, err)
+	if _, err := f.Seek(xingStart, io.SeekStart); err != nil {
+		return 0, nil, fmt.Errorf("seek to Xing header at %#x: %v", xingStart, err)
 	}
-	if s := string(b[:4]); s != "Xing" && s != "Info" {
+
+	// Read 4-byte ID at beginning of header.
+	id := make([]byte, 4)
+	if _, err := f.Read(id); err != nil {
+		return 0, nil, err
+	}
+	if VBRHeaderID(id) != XingID && VBRHeaderID(id) != InfoID {
 		// Okay, no Xing VBR header. Assume that the file has a fixed bitrate.
 		// (The other alternative is to read the whole file to count the number of frames.)
 		ms := (fi.Size() - fstart - footerLen) / int64(finfo.KbitRate) * 8
-		return time.Duration(ms) * time.Millisecond, 0, 0, nil
+		return time.Duration(ms) * time.Millisecond, nil, nil
+	}
+	vbrInfo := VBRInfo{ID: VBRHeaderID(id)}
+
+	// Read 4-byte flags indicating which fields are present.
+	var flags uint32
+	if err := binary.Read(f, binary.BigEndian, &flags); err != nil {
+		return 0, nil, err
 	}
 
-	r := bytes.NewReader(b[4:])
-	var flags uint32
-	if err := binary.Read(r, binary.BigEndian, &flags); err != nil {
-		return 0, 0, 0, err
-	}
+	// Read 4-byte frame count. This is optional in the spec, but we require it since it's
+	// needed to compute the duration.
 	if flags&0x1 == 0 {
-		return 0, 0, 0, errors.New("Xing header lacks number of frames")
+		return 0, nil, errors.New("Xing header lacks number of frames")
 	}
-	var nframes uint32
-	if err := binary.Read(r, binary.BigEndian, &nframes); err != nil {
-		return 0, 0, 0, err
+	if err := binary.Read(f, binary.BigEndian, &vbrInfo.Frames); err != nil {
+		return 0, nil, err
 	}
-	var nbytes uint32
+
+	// Read 4-byte byte count if present.
 	if flags&0x2 != 0 {
-		if err := binary.Read(r, binary.BigEndian, &nbytes); err != nil {
-			return 0, 0, 0, err
+		if err := binary.Read(f, binary.BigEndian, &vbrInfo.Bytes); err != nil {
+			return 0, nil, err
 		}
 	}
-	ms := int64(finfo.SamplesPerFrame) * int64(nframes) * 1000 / int64(finfo.SampleRate)
-	return time.Duration(ms) * time.Millisecond, int(nframes), int64(nbytes), nil
+
+	// Skip 100-byte TOC if present.
+	if flags&0x3 != 0 {
+		if _, err := f.Seek(100, io.SeekCurrent); err != nil {
+			return 0, nil, err
+		}
+	}
+
+	// Read 4-byte quality indicator if present.
+	if flags&0x4 != 0 {
+		var quality uint32
+		if err := binary.Read(f, binary.BigEndian, &quality); err != nil {
+			return 0, nil, err
+		}
+		vbrInfo.Quality = int(quality)
+	}
+
+	// Try to read the beginning of the LAME extension:
+	// http://gabriel.mp3-tech.org/mp3infotag.html
+	b := make([]byte, 10)
+	if _, err := f.Read(b); err == nil {
+		enc := b[:9]
+		ver := (b[9] & 0xf0) >> 4
+		if (ver == 0 || ver == 1) && isEncoderString(enc) {
+			vbrInfo.Encoder = strings.TrimSpace(string(enc))
+			vbrInfo.Method = EncodingMethod(b[9] & 0xf)
+		}
+	}
+
+	ms := int64(finfo.SamplesPerFrame) * int64(vbrInfo.Frames) * 1000 / int64(finfo.SampleRate)
+	return time.Duration(ms) * time.Millisecond, &vbrInfo, nil
+}
+
+// isEncoderString returns true if b contains only printable characters.
+func isEncoderString(b []byte) bool {
+	for _, ch := range b {
+		if !strconv.IsPrint(rune(ch)) {
+			return false
+		}
+	}
+	return true
+}
+
+// VBRInfo contains information from an Xing (or Info) header in the first frame.
+// See https://www.codeproject.com/Articles/8295/MPEG-Audio-Frame-Header#XINGHeader.
+type VBRInfo struct {
+	// ID contains the ID from the beginning of the header.
+	ID VBRHeaderID
+	// Frames contains the number of audio frames in the file.
+	Frames uint32
+	// Bytes contains the number of bytes of audio data in the file.
+	Bytes uint32
+	// Quality contains a poorly-defined quality indicator in the range [0, 100].
+	Quality int
+	// Encoder describes the encoder version, e.g. "LAME3.90a".
+	Encoder string
+	// Method describes how the audio was encoded.
+	Method EncodingMethod
+}
+
+// VBRHeaderID describes the type of header used to fill a VBRInfo.
+type VBRHeaderID string
+
+const (
+	// XingID typically indicates a VBR or ABR stream.
+	XingID VBRHeaderID = "Xing"
+	// InfoID typically indicates a CBR stream.
+	InfoID VBRHeaderID = "Info"
+)
+
+// EncodingMethod describes the encoding method used for the file.
+type EncodingMethod int
+
+const (
+	UnknownMethod EncodingMethod = 0
+	CBR           EncodingMethod = 1
+	ABR           EncodingMethod = 2
+	VBR1          EncodingMethod = 3 // Lame: VBR old / VBR RH
+	VBR2          EncodingMethod = 4 // Lame: VBR MTRH
+	VBR3          EncodingMethod = 5 // LAME: VBR MT
+	VBR4          EncodingMethod = 6
+	CBR2Pass      EncodingMethod = 8
+	ABR2Pass      EncodingMethod = 9
+)
+
+var encMethodNames = map[EncodingMethod]string{
+	UnknownMethod: "unknown",
+	CBR:           "CBR",
+	ABR:           "ABR",
+	VBR1:          "VBR1",
+	VBR2:          "VBR2",
+	VBR3:          "VBR3",
+	VBR4:          "VBR4",
+	CBR2Pass:      "CBR 2-pass",
+	ABR2Pass:      "ABR 2-pass",
+}
+
+func (m EncodingMethod) String() string {
+	if s, ok := encMethodNames[m]; ok {
+		return s
+	}
+	return fmt.Sprintf("invalid (%d)", int(m))
 }
